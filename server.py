@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-serverv1.1.py — Serveur de validation pour Render (v1.1, durci).
+server.py — Serveur de validation pour Render (v1.2, durci).
 Garde master.key, valide la réponse, renvoie la session_key CHIFFRÉE.
 
-Sur Render : renomme ce fichier en « server.py » (gunicorn ne peut pas importer
-un nom de module contenant un point) → Start Command inchangée :
+Sur Render : ce fichier s'appelle déjà « server.py » → Start Command inchangée :
     gunicorn server:app --bind 0.0.0.0:$PORT
+
+NOUVEAUTÉS v1.2 (fix « Not Found / 404 » sur le site et chez cron-job.org) :
+  - GET / répond désormais {"status": "ok", ...} : la racine du service ne
+    renvoie plus 404 (la v1.1 n'avait que /health et /unlock, donc toute
+    visite de la racine — navigateur, cron-job.org, health-check Render —
+    prenait un 404 Flask « The requested URL was not found »).
+  - Toutes les erreurs HTTP (404 route inconnue, 405 mauvaise méthode,
+    413 corps trop gros, 500 interne) renvoient un JSON MINUSCULE au lieu
+    des pages HTML de Flask : les réponses restent toujours minuscules et
+    claires (cron-job.org n'affiche plus jamais « sortie trop grande »).
 
 SÉCURITÉ v1.1 (par rapport à la v1.0) :
   1. Réponse chiffrée : la session_key ne circule JAMAIS en clair (ECDH + HKDF
@@ -29,6 +38,7 @@ SÉCURITÉ v1.1 (par rapport à la v1.0) :
      JAMAIS l'enveloppe, la réponse ni les clés.
 
 Endpoints :
+  GET  /        → {"status": "ok"} (ping racine : navigateur, cron-job.org)
   GET  /health  → {"status": "ok"}
   POST /unlock  → {machine_id, answer, envelope, nonce, ts, mac}
                   → 200 {"status":"ok","session_key_enc","nonce"}
@@ -197,6 +207,34 @@ def _encrypt_response(session_key: bytes, shared: bytes, salt: bytes):
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "fcrypt-server"}), 200
+
+
+@app.route("/", methods=["GET"])
+def root():
+    """Ping racine : navigateur, cron-job.org et health-check Render
+    (HEAD / inclus, géré automatiquement). JSON minuscule, aucun secret."""
+    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.2"}), 200
+
+
+# ── Erreurs HTTP en JSON minuscule (jamais les pages HTML de Flask) ──
+@app.errorhandler(404)
+def _not_found(_e):
+    return jsonify({"error": "not_found"}), 404
+
+
+@app.errorhandler(405)
+def _method_not_allowed(_e):
+    return jsonify({"error": "method_not_allowed"}), 405
+
+
+@app.errorhandler(413)
+def _payload_too_large(_e):
+    return jsonify({"error": "payload_too_large"}), 413
+
+
+@app.errorhandler(500)
+def _internal_error(_e):
+    return jsonify({"error": "server_error"}), 500
 
 
 @app.route("/unlock", methods=["POST"])
