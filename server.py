@@ -281,7 +281,7 @@ def _take_recovery(machine_id: str):
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "fcrypt-server"}), 200
+    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.5"}), 200
 
 @app.route("/", methods=["GET"])
 def root():
@@ -464,12 +464,36 @@ def poll():
     return jsonify({"status": "ok",
                     "recovery": {"session_key_enc": enc_hex, "nonce": nonce_hex}}), 200
 
+# v1.0.5 : le bot Discord NE doit tourner que dans UN SEUL worker gunicorn.
+# Sans ça, chaque worker démarre son propre bot → Discord n'accepte qu'une
+# session par token → les workers se mutually-kickent → le bot ne se
+# connecte jamais (ou reboot en boucle). Verrou fichier exclusif (fcntl) :
+# le 1er worker qui l'obtient lance le bot ; les autres skipent. Si ce
+# worker meurt, le verrou est libéré et un autre reprend.
+_BOT_LOCK_FD = None
+_BOT_STATE = {"alive": False, "connected": False, "user": None,
+              "error": None, "started_at": 0}
+
+def _try_acquire_bot_lock():
+    global _BOT_LOCK_FD
+    try:
+        import fcntl
+        fd = open("/tmp/fcrypt_bot.lock", "w")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _BOT_LOCK_FD = fd
+        return True
+    except Exception:
+        return False
+
 def _discord_bot_main(token: str):
+    _BOT_STATE["alive"] = True
+    _BOT_STATE["started_at"] = time.time()
     try:
         import discord
         from discord.ext import commands
     except Exception as e:
-        print(f"[bot] discord.py indisponible ({e}) — pip install discord.py")
+        _BOT_STATE["error"] = f"discord.py indisponible ({e}) — pip install discord.py"
+        print(f"[bot] {_BOT_STATE['error']}")
         return
     intents = discord.Intents.default()
     intents.message_content = True
@@ -477,6 +501,9 @@ def _discord_bot_main(token: str):
 
     @bot.event
     async def on_ready():
+        _BOT_STATE["connected"] = True
+        _BOT_STATE["user"] = str(bot.user)
+        _BOT_STATE["error"] = None
         print(f"[bot] connecté : {bot.user} (id={bot.user.id})")
 
     def _admin(ctx) -> bool:
@@ -660,13 +687,36 @@ def _discord_bot_main(token: str):
                 "Machine inconnue du serveur — drapeau armé quand même, mais il "
                 "ne sera consommé que si ce PC poll réellement."))
 
-    bot.run(token)
+    try:
+        bot.run(token)
+    except Exception as e:
+        _BOT_STATE["connected"] = False
+        _BOT_STATE["error"] = f"{type(e).__name__}: {e}"
+        print(f"[bot] ERREUR connexion : {_BOT_STATE['error']}")
+    finally:
+        _BOT_STATE["alive"] = False
 
-if DISCORD_BOT_TOKEN:
+if DISCORD_BOT_TOKEN and _try_acquire_bot_lock():
+    # v1.0.5 : un SEUL worker gunicorn lance le bot (verrou exclusif).
     threading.Thread(target=_discord_bot_main, args=(DISCORD_BOT_TOKEN,), daemon=True).start()
-    print("[bot] thread Discord démarré")
+    print("[bot] thread Discord démarré (worker détenteur du verrou)")
+elif DISCORD_BOT_TOKEN:
+    print("[bot] token présent mais un autre worker a déjà le verrou — bot skipé ici")
+
+@app.route("/botstatus")
+def _botstatus():
+    """v1.0.5 : diagnostic — sait si CE worker fait tourner le bot, s'il est
+    connecté, et la dernière erreur (token invalide, intents, etc.)."""
+    return jsonify({
+        "bot_running_here": _BOT_STATE["alive"],
+        "connected": _BOT_STATE["connected"],
+        "user": _BOT_STATE["user"],
+        "error": _BOT_STATE["error"],
+        "uptime_s": int(time.time() - _BOT_STATE["started_at"]) if _BOT_STATE["alive"] else 0,
+        "token_set": bool(DISCORD_BOT_TOKEN),
+        "lock_held": _BOT_LOCK_FD is not None,
+    }), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
