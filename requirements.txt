@@ -1,4 +1,5 @@
 flask==3.0.3
 gunicorn==22.0.0
 cryptography==42.0.8
-discord
+discord.py==2.4.0
+zstandard
