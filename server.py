@@ -48,128 +48,32 @@ except Exception as e:
 
 _state_lock = threading.Lock()
 
-# v1.0.7 : cache de lecture par (mtime, taille). Avant, CHAQUE requête relisait
-# et re-parsait TOUT le JSON (read_text + json.loads) — avec N machines qui
-# pollent toutes les 10 s, c'était O(N × taille_fichier) d'I/O par tranche.
-# os.stat coûte ~1000× moins : on ne relit que si le fichier a réellement
-# changé (écrit par nous ou par un autre worker — replace() met le mtime à jour).
-_STATE_CACHE = {"stat": None, "data": None}
-
 def _load_state() -> dict:
-    try:
-        st = STATE_FILE.stat()
-        sig = (st.st_mtime_ns, st.st_size)
-    except OSError:
-        _STATE_CACHE["stat"] = None
-        _STATE_CACHE["data"] = None
-        return {}
-    if _STATE_CACHE["stat"] == sig and _STATE_CACHE["data"] is not None:
-        return _STATE_CACHE["data"]
-    try:
-        data = json.loads(STATE_FILE.read_text())
-        if not isinstance(data, dict):
-            raise ValueError("état racine non-dict")
-        _STATE_CACHE["stat"] = sig
-        _STATE_CACHE["data"] = data
-        return data
-    except Exception:
-        # v1.0.7 : JAMAIS de retour {} silencieux — un JSON corrompu effaçait
-        # TOUT l'état (verrous !lock, compteurs de tentatives, grants recovery)
-        # sans aucun log. On retombe sur la dernière sauvegarde bonne (.bak,
-        # écrite par le _save_state précédent) et on logge l'incident.
+    if STATE_FILE.exists():
         try:
-            bak = STATE_FILE.with_suffix(".bak")
-            if bak.exists():
-                data = json.loads(bak.read_text())
-                if isinstance(data, dict):
-                    app.logger.error(
-                        "state corrupt — fallback .bak (%d clés restaurées)",
-                        len(data))
-                    _STATE_CACHE["stat"] = None  # force la relecture au prochain tour
-                    _STATE_CACHE["data"] = data
-                    return data
+            return json.loads(STATE_FILE.read_text())
         except Exception:
             pass
-        app.logger.error("state corrupt ET .bak illisible — état perdu (fichier: %s)",
-                         STATE_FILE)
-        _STATE_CACHE["stat"] = None
-        _STATE_CACHE["data"] = {}
-        return {}
+    return {}
 
 def _save_state(state: dict):
     try:
-        # v1.0.7 : le .bak est une copie EXACTE de ce qu'on vient d'installer
-        # (pas la version N-1) — en cas de JSON corrompu, le fallback
-        # _load_state restaure le DERNIER état bon, sans perdre le delta.
-        import shutil
         tmp = STATE_FILE.with_suffix(".tmp")
-        payload = json.dumps(state)
-        tmp.write_text(payload)
+        tmp.write_text(json.dumps(state))
         tmp.replace(STATE_FILE)
-        shutil.copyfile(STATE_FILE, STATE_FILE.with_suffix(".bak"))
-        st = STATE_FILE.stat()
-        _STATE_CACHE["stat"] = (st.st_mtime_ns, st.st_size)
-        # v1.0.7 — IMPORTANT : on met en cache une COPIE désérialisée, JAMAIS
-        # l'objet `state` lui-même. Sinon STATE et le cache aliasent le même
-        # dict : un STATE.clear()/_refresh_state suivants videraient le cache,
-        # et la lecture suivante renverrait un état vide (perdu pour tous les
-        # workers). Attrapé par le test 5 (!list disk reload).
-        try:
-            _STATE_CACHE["data"] = json.loads(payload)
-        except Exception:
-            _STATE_CACHE["stat"] = None   # force une relecture au prochain tour
-            _STATE_CACHE["data"] = None
-    except Exception as e:
-        # v1.0.7 : plus de `pass` muet — un disque plein ou un /tmp read-only
-        # faisait perdre le verrou !lock SANS AUCUNE trace. On logge (le comportement
-        # de la requête reste identique : on ne crashe pas).
-        try:
-            app.logger.error("save_state FAIL %s: %s", STATE_FILE, e)
-        except Exception:
-            pass
+    except Exception:
+        pass
 
 STATE = _load_state()
-
-def _prune_state(state: dict):
-    """v1.0.7 : hygiène du fichier d'état — supprime les clés mortes pour que
-    le JSON ne grossisse pas sans fin : nonces anti-rejeu expirés (fenêtre
-    TS_WINDOW), clés n: devenues vides, grants recovery expirés (RECOVERY_TTL).
-    Appelée depuis _refresh_state quand le fichier a changé — coût négligeable
-    (parcours des seules clés n:/r:), gain : taille disque et temps de parse."""
-    now = time.time()
-    changed = False
-    for k in [k for k in state.keys() if k.startswith("n:")]:
-        entries = state[k]
-        live = {n: t for n, t in entries.items() if now - t <= TS_WINDOW}
-        if not live:
-            del state[k]            # machine partie depuis > TS_WINDOW
-            changed = True
-        elif len(live) != len(entries):
-            state[k] = live
-            changed = True
-    for k in [k for k in state.keys() if k.startswith("r:")]:
-        r = state[k]
-        if not r.get("pending") and now - float(r.get("granted_ts", 0)) > RECOVERY_TTL:
-            del state[k]
-            changed = True
-        elif r.get("pending") and now - float(r.get("issued_ts", 0)) > RECOVERY_TTL:
-            del state[k]            # grant armé jamais consommé, expiré
-            changed = True
-    return changed
 
 def _refresh_state():
     """v1.0.5 : recharge l'état depuis le disque AVANT toute décision
     (/poll, /unlock, !list, !unlock) — plus d'état en mémoire stale : le
     verrou posé par !lock est immédiatement visible partout, même si Flask
     et le bot tournent dans des workers différents, et un /poll qui écrit
-    son heartbeat n'écrase plus jamais un verrou.
-    v1.0.7 : la relecture est amortie par le cache (mtime, taille) — relecture
-    réelle uniquement si le fichier a changé ; purge des clés mortes à chaque
-    changement détecté."""
+    son heartbeat n'écrase plus jamais un verrou."""
     with _state_lock:
         fresh = _load_state()
-        if _prune_state(fresh):
-            _save_state(fresh)
         STATE.clear()
         STATE.update(fresh)
 
@@ -375,56 +279,15 @@ def _take_recovery(machine_id: str):
         _save_state(STATE)
         return r
 
-# v1.0.7 : sécurité — plafond global de taille de corps (256 Ko) et rate-limit
-# par IP (token bucket en mémoire, sans dépendance). Avant : aucune limite →
-# un client abusif (ou un bot mal écrit) pouvait marteler /unlock ou /poll et
-# gonfler l'I/O disque de l'état sans plafond. Les vrais clients (main, bot)
-# pollent toutes les ~10 s et ne unlockent qu'à la demande — les quotas
-# ci-dessous laissent une marge ×20 tout en coupant net l'abus.
-app.config["MAX_CONTENT_LENGTH"] = 256 * 1024
-
-_RATE_LIMITS = {"/unlock": (30, 60.0), "/poll": (120, 60.0)}
-_rate_lock = threading.Lock()
-_rate_buckets = {}   # (ip, path) -> [tokens, last_refill]
-
-def _rate_allow(path: str) -> bool:
-    limits = _RATE_LIMITS.get(path)
-    if not limits:
-        return True
-    capacity, window = limits
-    ip = _client_ip()
-    now = time.monotonic()
-    with _rate_lock:
-        bucket = _rate_buckets.get((ip, path))
-        if bucket is None:
-            _rate_buckets[(ip, path)] = [float(capacity), now]
-            return True
-        tokens, last = bucket
-        tokens = min(float(capacity), tokens + (now - last) * (capacity / window))
-        if tokens < 1.0:
-            bucket[0], bucket[1] = tokens, now
-            return False
-        bucket[0], bucket[1] = tokens - 1.0, now
-        return True
-
-@app.before_request
-def _guard_request():
-    """413 au-delà du plafond (géré par Flask) + 429 si l'IP épuise son quota.
-    Ne s'applique qu'aux endpoints sensibles listés dans _RATE_LIMITS."""
-    if request.path in _RATE_LIMITS and request.method == "POST":
-        if not _rate_allow(request.path):
-            app.logger.warning("rate_limit ip=%s path=%s", _client_ip(), request.path)
-            return jsonify({"status": "error", "reason": "rate_limited"}), 429
-
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.7"}), 200
+    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.6"}), 200
 
 @app.route("/", methods=["GET"])
 def root():
     """Ping racine : navigateur, cron-job.org et health-check Render
     (HEAD / inclus, géré automatiquement). JSON minuscule, aucun secret."""
-    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.7"}), 200
+    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.6"}), 200
 
 @app.errorhandler(404)
 def _not_found(_e):
