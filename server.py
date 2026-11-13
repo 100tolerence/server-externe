@@ -281,13 +281,13 @@ def _take_recovery(machine_id: str):
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.5"}), 200
+    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.6"}), 200
 
 @app.route("/", methods=["GET"])
 def root():
     """Ping racine : navigateur, cron-job.org et health-check Render
     (HEAD / inclus, géré automatiquement). JSON minuscule, aucun secret."""
-    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.5"}), 200
+    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.6"}), 200
 
 @app.errorhandler(404)
 def _not_found(_e):
@@ -488,6 +488,18 @@ def _try_acquire_bot_lock():
 def _discord_bot_main(token: str):
     _BOT_STATE["alive"] = True
     _BOT_STATE["started_at"] = time.time()
+    # v1.0.5 : logging détaillé — sans ça, les close codes du gateway Discord
+    # (4004 token invalide, 4014 intents non activées, 4013 session dupliquée)
+    # sont avalés silencieusement et le bot « ne connecte jamais » sans erreur.
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logging.getLogger("discord").setLevel(logging.DEBUG)
+    logging.getLogger("discord.gateway").setLevel(logging.DEBUG)
+    logging.getLogger("discord.http").setLevel(logging.INFO)
     try:
         import discord
         from discord.ext import commands
@@ -495,9 +507,32 @@ def _discord_bot_main(token: str):
         _BOT_STATE["error"] = f"discord.py indisponible ({e}) — pip install discord.py"
         print(f"[bot] {_BOT_STATE['error']}")
         return
+    tok_safe = token[:8] + "…" + token[-4:] if len(token) > 12 else "(court?)"
+    print(f"[bot] bot.run imminent — token={tok_safe} "
+          f"python={__import__('sys').version.split()[0]} "
+          f"discord.py={discord.__version__} "
+          f"admin_ids={DISCORD_ADMIN_IDS}")
+    # v1.0.6 : shim asyncio pour Python 3.13/3.14. Sur ces versions,
+    # asyncio.get_event_loop() ne crée PLUS de loop s'il n'y en a pas dans le
+    # thread → discord.py 2.4/2.5 peut rester coincé au handshake gateway WS
+    # sans lever d'erreur (bot.run tourne, on_ready jamais). On installe donc
+    # explicitement une loop neuve attachée à CE thread avant bot.run.
+    import asyncio
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        print(f"[bot] event loop asyncio installée ({loop.__class__.__name__})")
+    except Exception as e:
+        print(f"[bot] WARN install loop asyncio échouée ({e}) — bot.run tente quand même")
     intents = discord.Intents.default()
     intents.message_content = True
     bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+    @bot.event
+    async def on_connect():
+        # WS ouvert vers le gateway, avant IDENTIFY. Prouve que le token est
+        # accepté au niveau HTTP/WS (sinon on reste bloqué avant ici).
+        print(f"[bot] on_connect — WS gateway ouvert, IDENTIFY en cours")
 
     @bot.event
     async def on_ready():
@@ -505,6 +540,23 @@ def _discord_bot_main(token: str):
         _BOT_STATE["user"] = str(bot.user)
         _BOT_STATE["error"] = None
         print(f"[bot] connecté : {bot.user} (id={bot.user.id})")
+
+    @bot.event
+    async def on_disconnect():
+        _BOT_STATE["connected"] = False
+        print(f"[bot] on_disconnect — WS fermé (close code "
+              f"{getattr(bot.ws, 'close_code', '?')})")
+
+    @bot.event
+    async def on_resumed():
+        print(f"[bot] on_resumed — session RESUMED")
+
+    @bot.event
+    async def on_error(event_method, *args, **kwargs):
+        import traceback
+        tb = traceback.format_exc()
+        _BOT_STATE["error"] = f"on_error({event_method}): {tb[-300:]}"
+        print(f"[bot] on_error {event_method}\n{tb}")
 
     def _admin(ctx) -> bool:
         return str(ctx.author.id) in DISCORD_ADMIN_IDS
@@ -687,14 +739,33 @@ def _discord_bot_main(token: str):
                 "Machine inconnue du serveur — drapeau armé quand même, mais il "
                 "ne sera consommé que si ce PC poll réellement."))
 
+    # Heartbeat de diagnostic : logge l'état toutes les 30s pour qu'on voie
+    # si le bot reste bloqué avant on_connect (token) ou avant on_ready
+    # (intents). Tournant dans le bot thread, n'utilise PAS l'event loop.
+    import threading as _th
+    def _hb():
+        while _BOT_STATE["alive"]:
+            _BOT_STATE["hb"] = int(time.time())
+            print(f"[bot] heartbeat — alive={_BOT_STATE['alive']} "
+                  f"connected={_BOT_STATE['connected']} "
+                  f"user={_BOT_STATE['user']} "
+                  f"close_code={getattr(bot.ws,'close_code',None) if bot.ws else 'no-ws'} "
+                  f"err={_BOT_STATE['error']}")
+            time.sleep(30)
+    _th.Thread(target=_hb, daemon=True).start()
+
     try:
+        print(f"[bot] appel bot.run(token)…")
         bot.run(token)
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
         _BOT_STATE["connected"] = False
         _BOT_STATE["error"] = f"{type(e).__name__}: {e}"
-        print(f"[bot] ERREUR connexion : {_BOT_STATE['error']}")
+        print(f"[bot] ERREUR bot.run : {type(e).__name__}: {e}\n{tb}")
     finally:
         _BOT_STATE["alive"] = False
+        print("[bot] bot.run terminé (finally)")
 
 if DISCORD_BOT_TOKEN and _try_acquire_bot_lock():
     # v1.0.5 : un SEUL worker gunicorn lance le bot (verrou exclusif).
@@ -714,9 +785,13 @@ def _botstatus():
         "error": _BOT_STATE["error"],
         "uptime_s": int(time.time() - _BOT_STATE["started_at"]) if _BOT_STATE["alive"] else 0,
         "token_set": bool(DISCORD_BOT_TOKEN),
+        "token_prefix": (DISCORD_BOT_TOKEN[:8] + "…") if len(DISCORD_BOT_TOKEN) > 8 else "(court?)",
         "lock_held": _BOT_LOCK_FD is not None,
+        "last_heartbeat": _BOT_STATE.get("hb", 0),
+        "python": __import__("sys").version.split()[0],
     }), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
