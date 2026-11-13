@@ -66,6 +66,17 @@ def _save_state(state: dict):
 
 STATE = _load_state()
 
+def _refresh_state():
+    """v1.0.5 : recharge l'état depuis le disque AVANT toute décision
+    (/poll, /unlock, !list, !unlock) — plus d'état en mémoire stale : le
+    verrou posé par !lock est immédiatement visible partout, même si Flask
+    et le bot tournent dans des workers différents, et un /poll qui écrit
+    son heartbeat n'écrase plus jamais un verrou."""
+    with _state_lock:
+        fresh = _load_state()
+        STATE.clear()
+        STATE.update(fresh)
+
 def _env_hash(envelope: str) -> str:
     return hashlib.sha256(envelope.encode("utf-8")).hexdigest()
 
@@ -276,7 +287,7 @@ def health():
 def root():
     """Ping racine : navigateur, cron-job.org et health-check Render
     (HEAD / inclus, géré automatiquement). JSON minuscule, aucun secret."""
-    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.4"}), 200
+    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.5"}), 200
 
 @app.errorhandler(404)
 def _not_found(_e):
@@ -321,6 +332,7 @@ def unlock():
 
     env_h = _env_hash(envelope)
 
+    _refresh_state()  # v1.0.5 : décision sur l'état frais du disque
     if _is_locked(machine_id, env_h) or _env_unlocked(env_h) \
             or _env_attempts(env_h) >= MAX_ATTEMPTS or _machine_failed(machine_id):
         _touch_machine(machine_id)
@@ -402,6 +414,7 @@ def poll():
             or len(envelope) > 22000):
         return jsonify({"status": "error", "reason": "bad_fields"}), 400
 
+    _refresh_state()  # v1.0.5 : le verrou !lock est vu même posé par un autre worker
     env_h = _env_hash(envelope)
     try:
         eph_pub, salt, nonce_env, ct = _parse_envelope(envelope)
@@ -507,8 +520,8 @@ def _discord_bot_main(token: str):
             await ctx.send(embed=_embed("Accès refusé", COL_ERR))
             return
         now = time.time()
+        _refresh_state()
         with _state_lock:
-            STATE.update(_load_state())
             _mids = {k[2:] for k in STATE if k[:2] in ("h:", "m:")}
             for ek, ev in STATE.items():
                 if ek[:2] == "e:" and isinstance(ev, dict):
@@ -562,9 +575,12 @@ def _discord_bot_main(token: str):
                 "déjà chiffrés le restent."))
             return
         n = _lock_machine(mid)
+        note = ("" if n > 0 else
+                " (0 enveloppe = aucun /unlock tenté avant le lock — le verrou "
+                "machine reste TOTAL : /poll renvoie verrouillé et /unlock est bloqué.)")
         await ctx.send(embed=_embed(
             f"Machine verrouillée — `{mid}`", COL_LOCK,
-            f"{n} enveloppe(s) associée(s) gelée(s).",
+            f"{n} enveloppe(s) associée(s) gelée(s).{note}",
             fields=[
                 ("/unlock", "Renvoie désormais `locked_out` même si la réponse au QCM est correcte.", False),
                 ("!recovery", "Désactivé pour cette machine.", False),
@@ -583,8 +599,8 @@ def _discord_bot_main(token: str):
                 "Usage", COL_WARN,
                 "`!unlock <machine_id>` — retire le verrou posé par `!lock`."))
             return
+        _refresh_state()  # v1.0.5 : reset sur l'état frais du disque
         with _state_lock:
-            STATE.update(_load_state())
             m = STATE.get("m:" + mid)
             was_locked = bool(m and m.get("locked"))
             reset_envs = 0
