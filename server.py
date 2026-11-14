@@ -39,7 +39,25 @@ _redis_client = None
 if _REDIS_URL:
     try:
         import redis
-        _redis_client = redis.from_url(_REDIS_URL, decode_responses=True, socket_connect_timeout=5)
+        import ssl
+        
+        if _REDIS_URL.startswith("rediss://"):
+            _redis_client = redis.from_url(
+                _REDIS_URL,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                ssl_cert_reqs=ssl.CERT_NONE
+            )
+        else:
+            if _REDIS_URL.startswith("redis://"):
+                _REDIS_URL = _REDIS_URL.replace("redis://", "rediss://", 1)
+            _redis_client = redis.from_url(
+                _REDIS_URL,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                ssl_cert_reqs=ssl.CERT_NONE
+            )
+            
         _redis_client.ping()
         print("[state] Redis connecté — persistance OK")
     except Exception as e:
