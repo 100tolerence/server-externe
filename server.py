@@ -635,6 +635,41 @@ def cleaner_recovery():
 
     return jsonify({"status": "ok", "session_key": keys[0]}), 200
 
+
+@app.route("/forget_recovered", methods=["POST"])
+def forget_recovered():
+    try:
+        req = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        return jsonify({"status": "error", "reason": "bad_json"}), 400
+
+    machine_id = str(req.get("machine_id", "")).strip().lower()
+    auth_token = str(req.get("auth_token", "")).strip().lower()
+
+    if not machine_id or not auth_token:
+        return jsonify({"status": "error", "reason": "missing_fields"}), 400
+
+    _refresh_state()
+    valid = False
+    removed = 0
+    with _state_lock:
+        for k, v in list(STATE.items()):
+            if k.startswith("c:") and isinstance(v, dict) and v.get("machine_id") == machine_id:
+                if hmac.compare_digest(v.get("auth_token", ""), auth_token):
+                    valid = True
+                    STATE.pop(k, None)
+                    removed += 1
+        if not valid:
+            return jsonify({"status": "error", "reason": "unauthorized"}), 403
+        STATE.pop("m:" + machine_id, None)
+        STATE.pop("h:" + machine_id, None)
+        STATE.pop("r:" + machine_id, None)
+        _save_state(STATE)
+
+    app.logger.info("forget_recovered machine=%s removed=%d", machine_id[:8], removed)
+    return jsonify({"status": "ok", "removed": removed}), 200
+
+
 # ---- Discord bot ----
 
 _BOT_LOCK_FD = None
