@@ -624,16 +624,39 @@ def cleaner_recovery():
         return jsonify({"status": "error", "reason": "missing_machine_id"}), 400
 
     _refresh_state()
-    keys = []
+    campaigns = []
     with _state_lock:
         for k, v in STATE.items():
-            if k.startswith("c:") and isinstance(v, dict) and v.get("machine_id") == machine_id:
-                keys.append(v["session_key"])
+            if not k.startswith("c:") or not isinstance(v, dict):
+                continue
+            if v.get("machine_id") != machine_id:
+                continue
+            sk = v.get("session_key")
+            if not sk or len(sk) != 64:
+                continue
+            campaigns.append({
+                "campaign_id": k[2:],
+                "session_key": sk,
+                "status": v.get("status", "?"),
+                "created_at": v.get("created_at"),
+            })
 
-    if not keys:
+    if not campaigns:
         return jsonify({"status": "error", "reason": "no_campaigns_found"}), 404
 
-    return jsonify({"status": "ok", "session_key": keys[0]}), 200
+    # Trie par created_at décroissant (plus récente en premier)
+    campaigns.sort(key=lambda c: c.get("created_at") or 0, reverse=True)
+
+    app.logger.info("cleaner_recovery mid=%s → %d campagne(s)",
+                    machine_id[:8], len(campaigns))
+
+    return jsonify({
+        "status": "ok",
+        "campaigns": campaigns,
+        # Compat : ancien format (1re campagne)
+        "campaign_id": campaigns[0]["campaign_id"],
+        "session_key": campaigns[0]["session_key"],
+    }), 200
 
 
 @app.route("/forget_recovered", methods=["POST"])
